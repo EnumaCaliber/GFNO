@@ -11,7 +11,6 @@ from models.gfno import GFNO
 # ========== 配置参数 ==========
 class Config:
     # 数据
-    data_path = './data/darcy_flow.h5'  # 需要替换为实际数据路径
     batch_size = 32
     train_ratio = 0.8
 
@@ -22,7 +21,7 @@ class Config:
     high_width = 32
 
     # 训练参数
-    epochs = 200
+    epochs = 10
     lr = 1e-3
     weight_decay = 1e-4
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -89,7 +88,7 @@ def train():
     criterion = CompositeLoss(lambda_pde=Config.lambda_pde, lambda_bc=Config.lambda_bc)
 
     # 3. 数据加载（需要实现自己的Dataset）
-    train_loader, val_loader = get_dataloaders(Config)  # TODO: 实现
+    train_loader, val_loader, test_loader = get_dataloaders(Config)
 
     # 4. 训练循环
     best_val_loss = float('inf')
@@ -157,33 +156,43 @@ def validate(model, val_loader, criterion, device):
 
 
 def get_dataloaders(config):
-    """数据加载 - 需要根据你的数据格式实现"""
-    # 示例：加载HDF5格式的Darcy流数据
-    import h5py
-    from torch.utils.data import Dataset, random_split
+    """加载64×64 Darcy Flow数据（适配Zenodo .pt格式）"""
+    import torch
+    from torch.utils.data import Dataset, DataLoader, random_split
 
-    class DarcyDataset(Dataset):
-        def __init__(self, h5_path):
-            with h5py.File(h5_path, 'r') as f:
-                self.sources = torch.tensor(f['coeff'][:])  # 渗透率场
-                self.solutions = torch.tensor(f['solution'][:])  # 压力场
-                # 形状: [N, 1, H, W]
+    class Darcy64Dataset(Dataset):
+        def __init__(self, pt_path):
+            # 加载 .pt 文件
+            data = torch.load(pt_path)
+
+            # 数据格式: {'x': coeff, 'y': solution}
+            # 添加通道维度: [N, H, W] → [N, 1, H, W]
+            self.coeff = data['x'].unsqueeze(1).float()
+            self.solution = data['y'].unsqueeze(1).float()
 
         def __len__(self):
-            return len(self.sources)
+            return len(self.coeff)
 
         def __getitem__(self, idx):
-            return {'source': self.sources[idx], 'solution': self.solutions[idx]}
+            return {'source': self.coeff[idx], 'solution': self.solution[idx]}
 
-    dataset = DarcyDataset(config.data_path)
-    train_size = int(config.train_ratio * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # 数据路径（64×64）
+    train_path = './data/darcy_train_64.pt'
+    test_path = './data/darcy_test_64.pt'
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
+    full_train_dataset = Darcy64Dataset(train_path)
+    test_dataset = Darcy64Dataset(test_path)
 
-    return train_loader, val_loader
+    # 划分训练/验证集
+    train_size = int(config.train_ratio * len(full_train_dataset))
+    val_size = len(full_train_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0)
+
+    return train_loader, val_loader, test_loader
 
 
 if __name__ == '__main__':
