@@ -1,199 +1,250 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-import numpy as np
+from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 import os
+import argparse
 from models.gfno import GFNO
 
 
-# ========== 配置参数 ==========
+# ══════════════════════════════════════════════════════
+#  配置
+# ══════════════════════════════════════════════════════
+
 class Config:
     # 数据
-    batch_size = 32
-    train_ratio = 0.8
+    domain_type  = 'l_shape'   # 'l_shape' | 'circle_hole' | 'square'
+    n_samples    = 500
+    batch_size   = 16          # 减小 batch 适配边界分支显存
+    train_ratio  = 0.8
 
-    # 模型参数[citation:2]
-    smooth_modes = (12, 12)  # 保留的低频模态数（网格尺寸的1/8~1/4）
-    smooth_width = 64  # 隐藏通道数
-    high_modes = (16, 16)  # 高频分支保留更多模态
-    high_width = 32
+    # 模型
+    smooth_modes    = (12, 12)
+    smooth_width    = 64
+    high_modes      = (16, 16)
+    high_width      = 32
+    n_boundary_pts  = 64
+    fusion_type     = 'attention'
 
-    # 训练参数
-    epochs = 10
-    lr = 1e-3
+    # 训练
+    epochs       = 50
+    lr           = 1e-3
     weight_decay = 1e-4
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    grad_clip    = 1.0
+    device       = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # 损失权重
-    lambda_pde = 0.1  # PDE残差权重
-    lambda_bc = 0.5  # 边界条件权重
+    lambda_reg   = 0.05        # 高频残差正则
 
 
-def relative_l2_loss(pred, target):
-    """相对L2损失：||pred - target||₂ / ||target||₂"""
-    return torch.norm(pred - target) / torch.norm(target)
+# ══════════════════════════════════════════════════════
+#  Dataset
+# ══════════════════════════════════════════════════════
+
+class IrregularDomainDataset(Dataset):
+    def __init__(self, pt_path):
+        data = torch.load(pt_path, map_location='cpu', weights_only=False)
+
+        self.coeff    = data['x'].unsqueeze(1).float()   # [N, 1, H, W]
+        self.solution = data['y'].unsqueeze(1).float()   # [N, 1, H, W]
+        self.boundary = data.get('boundary', None)       # [N, n_bc, 3] or None
+        self.mask     = data.get('mask', None)           # [H, W] bool
+
+        # 归一化（只在域内点统计）
+        if self.mask is not None:
+            m = self.mask.unsqueeze(0).unsqueeze(0).float()
+            n_valid = m.sum()
+            self.sol_mean = (self.solution * m).sum() / n_valid
+            self.sol_std  = torch.sqrt(((self.solution * m - self.sol_mean * m) ** 2).sum() / n_valid) + 1e-8
+        else:
+            self.sol_mean = self.solution.mean()
+            self.sol_std  = self.solution.std() + 1e-8
+
+        self.solution = (self.solution - self.sol_mean) / self.sol_std
+
+    def __len__(self):
+        return len(self.coeff)
+
+    def __getitem__(self, idx):
+        item = {'source': self.coeff[idx], 'solution': self.solution[idx]}
+        if self.boundary is not None:
+            item['boundary'] = self.boundary[idx]
+        if self.mask is not None:
+            item['mask'] = self.mask
+        return item
+
+
+# ══════════════════════════════════════════════════════
+#  损失函数
+# ══════════════════════════════════════════════════════
+
+def relative_l2(pred, target, mask=None):
+    if mask is not None:
+        m = mask.unsqueeze(0).unsqueeze(0).float().to(pred.device)
+        pred, target = pred * m, target * m
+    return torch.norm(pred - target) / (torch.norm(target) + 1e-8)
 
 
 class CompositeLoss(nn.Module):
-    """复合损失函数：MSE + PDE残差 + 边界约束"""
-
-    def __init__(self, lambda_pde=0.1, lambda_bc=0.5):
+    def __init__(self, lambda_reg=0.05):
         super().__init__()
-        self.lambda_pde = lambda_pde
-        self.lambda_bc = lambda_bc
+        self.lambda_reg = lambda_reg
         self.mse = nn.MSELoss()
 
-    def forward(self, pred, target, u_smooth=None, u_high=None, boundary_info=None):
-        # 1. 数据拟合损失
-        loss_data = self.mse(pred, target)
+    def forward(self, pred, target, u_smooth=None, u_high=None, mask=None):
+        if mask is not None:
+            m = mask.unsqueeze(0).unsqueeze(0).float().to(pred.device)
+            pred_m   = pred * m
+            target_m = target * m
+            smooth_m = u_smooth * m if u_smooth is not None else None
+            high_m   = u_high   * m if u_high   is not None else None
+        else:
+            pred_m, target_m = pred, target
+            smooth_m, high_m = u_smooth, u_high
 
-        # 2. 边界条件损失
-        loss_bc = 0
-        if boundary_info is not None:
-            # 在边界采样点上计算误差
-            loss_bc = self._compute_boundary_loss(pred, boundary_info)
+        loss_data = self.mse(pred_m, target_m)
 
-        # 3. 正则化：控制各分支的平衡
-        loss_reg = 0
-        if u_smooth is not None and u_high is not None:
-            # 鼓励高频分支学习残差（而非主信号）
-            residual = target - u_smooth
-            loss_reg = self.mse(u_high, residual.detach())
+        # 高频分支残差正则：鼓励 u_high 逼近 (target - u_smooth)
+        loss_reg = 0.0
+        if smooth_m is not None and high_m is not None:
+            residual = (target_m - smooth_m).detach()
+            loss_reg = self.mse(high_m, residual)
 
-        return loss_data + self.lambda_bc * loss_bc + 0.05 * loss_reg
-
-    def _compute_boundary_loss(self, pred, boundary_info):
-        """在边界点上计算预测值与真实边界条件的差异"""
-        # boundary_info: [n_points, 3] (x, y, g_true)
-        # 需要在边界点上采样pred的值
-        # 简化实现，实际需要双线性插值
-        return 0  # placeholder
+        return loss_data + self.lambda_reg * loss_reg
 
 
-def train():
-    # 1. 初始化模型
+# ══════════════════════════════════════════════════════
+#  数据加载（自动生成）
+# ══════════════════════════════════════════════════════
+
+def get_dataloaders(cfg):
+    train_path = f'./data/{cfg.domain_type}_train.pt'
+
+    if not os.path.exists(train_path):
+        print("数据文件不存在，正在生成...")
+        import sys; sys.path.insert(0, '.')
+        from data.generate_irregular import generate_dataset
+        generate_dataset(cfg.domain_type, N=64, n_samples=cfg.n_samples)
+
+    dataset = IrregularDomainDataset(train_path)
+    n_train = int(cfg.train_ratio * len(dataset))
+    n_val   = len(dataset) - n_train
+    train_ds, val_ds = random_split(dataset, [n_train, n_val])
+
+    kw = dict(num_workers=0, pin_memory=False)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,  **kw)
+    val_loader   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, **kw)
+    return train_loader, val_loader
+
+
+# ══════════════════════════════════════════════════════
+#  训练 / 验证
+# ══════════════════════════════════════════════════════
+
+def validate(model, loader, criterion, device):
+    model.eval()
+    total_loss, total_rel = 0.0, 0.0
+    with torch.no_grad():
+        for batch in loader:
+            f       = batch['source'].to(device)
+            u_true  = batch['solution'].to(device)
+            bc_info = batch.get('boundary', None)
+            if bc_info is not None: bc_info = bc_info.to(device)
+            mask    = batch.get('mask', None)
+            if mask is not None: mask = mask[0].to(device)
+
+            u_pred, branches = model(f, bc_info, domain_mask=mask)
+            loss    = criterion(u_pred, u_true,
+                                u_smooth=branches['smooth'],
+                                u_high=branches['high'], mask=mask)
+            rel_l2  = relative_l2(u_pred, u_true, mask)
+            total_loss += loss.item()
+            total_rel  += rel_l2.item()
+
+    n = len(loader)
+    return total_loss / n, total_rel / n
+
+
+def train(cfg=None):
+    if cfg is None:
+        cfg = Config()
+
+    print(f"设备: {cfg.device} | 域: {cfg.domain_type}")
+
     model = GFNO(
-        smooth_modes=Config.smooth_modes,
-        smooth_width=Config.smooth_width,
-        high_modes=Config.high_modes,
-        high_width=Config.high_width,
-        fusion_type='attention'
-    ).to(Config.device)
+        smooth_modes=cfg.smooth_modes, smooth_width=cfg.smooth_width,
+        high_modes=cfg.high_modes,   high_width=cfg.high_width,
+        n_boundary_points=cfg.n_boundary_pts, fusion_type=cfg.fusion_type
+    ).to(cfg.device)
 
-    # 2. 优化器和调度器
-    optimizer = optim.AdamW(model.parameters(), lr=Config.lr, weight_decay=Config.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.epochs)
-    criterion = CompositeLoss(lambda_pde=Config.lambda_pde, lambda_bc=Config.lambda_bc)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"参数量: {n_params:,}")
 
-    # 3. 数据加载（需要实现自己的Dataset）
-    train_loader, val_loader, test_loader = get_dataloaders(Config)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+    criterion = CompositeLoss(lambda_reg=cfg.lambda_reg)
 
-    # 4. 训练循环
-    best_val_loss = float('inf')
+    train_loader, val_loader = get_dataloaders(cfg)
 
-    for epoch in range(Config.epochs):
+    best_val  = float('inf')
+    os.makedirs('checkpoints', exist_ok=True)
+
+    for epoch in range(cfg.epochs):
         model.train()
-        train_loss = 0
+        ep_losses = []
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{Config.epochs}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{cfg.epochs}")
         for batch in pbar:
-            f = batch['source'].to(Config.device)  # [b,1,h,w] 源项
-            u_true = batch['solution'].to(Config.device)  # [b,1,h,w] 真实解
-            boundary = batch.get('boundary', None)  # 边界条件
-            boundary_info = boundary.to(Config.device) if boundary is not None else None
+            f       = batch['source'].to(cfg.device)
+            u_true  = batch['solution'].to(cfg.device)
+            bc_info = batch.get('boundary', None)
+            if bc_info is not None: bc_info = bc_info.to(cfg.device)
+            mask    = batch.get('mask', None)
+            if mask is not None: mask = mask[0].to(cfg.device)
 
-            # 前向传播
-            u_pred, branch_outputs = model(f, boundary_info)
-
-            # 计算损失
+            u_pred, branches = model(f, bc_info, domain_mask=mask)
             loss = criterion(u_pred, u_true,
-                             u_smooth=branch_outputs['smooth'],
-                             u_high=branch_outputs['high'],
-                             boundary_info=boundary_info)
+                             u_smooth=branches['smooth'],
+                             u_high=branches['high'], mask=mask)
 
-            # 反向传播
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
 
-            train_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            ep_losses.append(loss.item())
+            pbar.set_postfix(loss=f"{loss.item():.5f}")
 
         scheduler.step()
-        avg_train_loss = train_loss / len(train_loader)
+        val_loss, val_rel = validate(model, val_loader, criterion, cfg.device)
+        avg_train = sum(ep_losses) / len(ep_losses)
 
-        # 验证
-        val_loss = validate(model, val_loader, criterion, Config.device)
+        print(f"  Train={avg_train:.5f} | Val={val_loss:.5f} | RelL2={val_rel:.4f}")
 
-        print(f"Epoch {epoch + 1}: Train Loss = {avg_train_loss:.6f}, Val Loss = {val_loss:.6f}")
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save({
+                'epoch': epoch, 'model_state': model.state_dict(),
+                'val_loss': val_loss, 'val_rel_l2': val_rel,
+            }, f'checkpoints/best_{cfg.domain_type}.pth')
+            print(f"  ✅ 保存最佳模型 (val={val_loss:.5f})")
 
-        # 保存最佳模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_gfno.pth')
-
-    print(f"训练完成！最佳验证损失: {best_val_loss:.6f}")
-
-
-def validate(model, val_loader, criterion, device):
-    model.eval()
-    total_loss = 0
-
-    with torch.no_grad():
-        for batch in val_loader:
-            f = batch['source'].to(device)
-            u_true = batch['solution'].to(device)
-            boundary = batch.get('boundary', None)
-            boundary_info = boundary.to(device) if boundary is not None else None
-
-            u_pred, _ = model(f, boundary_info)
-            loss = criterion(u_pred, u_true, boundary_info=boundary_info)
-            total_loss += loss.item()
-
-    return total_loss / len(val_loader)
-
-
-def get_dataloaders(config):
-    """加载64×64 Darcy Flow数据（适配Zenodo .pt格式）"""
-    import torch
-    from torch.utils.data import Dataset, DataLoader, random_split
-
-    class Darcy64Dataset(Dataset):
-        def __init__(self, pt_path):
-            # 加载 .pt 文件
-            data = torch.load(pt_path)
-
-            # 数据格式: {'x': coeff, 'y': solution}
-            # 添加通道维度: [N, H, W] → [N, 1, H, W]
-            self.coeff = data['x'].unsqueeze(1).float()
-            self.solution = data['y'].unsqueeze(1).float()
-
-        def __len__(self):
-            return len(self.coeff)
-
-        def __getitem__(self, idx):
-            return {'source': self.coeff[idx], 'solution': self.solution[idx]}
-
-    # 数据路径（64×64）
-    train_path = './data/darcy_train_64.pt'
-    test_path = './data/darcy_test_64.pt'
-
-    full_train_dataset = Darcy64Dataset(train_path)
-    test_dataset = Darcy64Dataset(test_path)
-
-    # 划分训练/验证集
-    train_size = int(config.train_ratio * len(full_train_dataset))
-    val_size = len(full_train_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
-
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0)
-
-    return train_loader, val_loader, test_loader
+    print(f"\n训练完成！最佳验证损失: {best_val:.5f}")
 
 
 if __name__ == '__main__':
-    train()
+    p = argparse.ArgumentParser()
+    p.add_argument('--domain', default='l_shape',
+                   choices=['l_shape', 'circle_hole', 'square'])
+    p.add_argument('--epochs',   type=int, default=50)
+    p.add_argument('--batch',    type=int, default=16)
+    p.add_argument('--n',        type=int, default=500)
+    args = p.parse_args()
+
+    cfg = Config()
+    cfg.domain_type = args.domain
+    cfg.epochs      = args.epochs
+    cfg.batch_size  = args.batch
+    cfg.n_samples   = args.n
+    train(cfg)
