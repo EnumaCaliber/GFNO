@@ -1,0 +1,31 @@
+data:
+  INPUT_X: 'Omesh/Random_UnitCell_Deform_X_10_interp.npy'
+  INPUT_Y: 'Omesh/Random_UnitCell_Deform_Y_10_interp.npy'
+  OUTPUT_Sigma: 'Omesh/Random_UnitCell_Deform_sigma_10_interp.npy'
+  Ntotal: 2000
+  ntrain: 1000
+  ntest: 200
+  r1: 2
+  r2: 1
+  s1: 33   # (65-1)/2 + 1
+  s2: 41   # (41-1)/1 + 1
+
+train:
+  batch_size: 20
+  learning_rate: 0.001
+  epochs: 501
+  step_size: 100
+  gamma: 0.5
+  weight_decay: 1e-4
+
+model:
+  modes1: 12
+  modes2: 12
+  width: 32
+  rank: 4
+  n_layers: 4
+  padding: 9
+
+logging:
+  save_every: 100
+  model_dir: '../model'
